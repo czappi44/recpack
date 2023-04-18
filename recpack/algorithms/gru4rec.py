@@ -4,6 +4,8 @@ import time
 from typing import Tuple, List, Iterator, Optional
 
 from scipy.sparse import csr_matrix, lil_matrix
+import numpy as np
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -132,7 +134,8 @@ class GRU4Rec(TorchMLAlgorithm):
         num_layers: int = 1,
         hidden_size: int = 100,
         num_components: int = 250,
-        dropout: float = 0.0,
+        dropout_p_embed: float = 0,
+        dropout_p_hidden: float = 0,
         optimization_algorithm: str = "adagrad",
         momentum: float = 0.0,
         clipnorm: float = 1.0,
@@ -150,6 +153,8 @@ class GRU4Rec(TorchMLAlgorithm):
         keep_last: bool = False,
         predict_topK: int = None,
         validation_sample_size: int = None,
+        final_activation: str = None,
+        use_correct_weight_init: bool = False,
     ):
         super().__init__(
             batch_size,
@@ -169,12 +174,15 @@ class GRU4Rec(TorchMLAlgorithm):
         self.num_layers = num_layers
         self.hidden_size = hidden_size
         self.num_components = num_components
-        self.dropout = dropout
+        self.dropout_p_embed = dropout_p_embed
+        self.dropout_p_hidden = dropout_p_hidden
         self.optimization_algorithm = optimization_algorithm
         self.momentum = momentum
         self.clipnorm = clipnorm
         self.bptt = bptt
         self.num_negatives = num_negatives
+        self.final_activation = final_activation
+        self.use_correct_weight_init = use_correct_weight_init
 
     def _init_model(self, X: InteractionMatrix) -> None:
         # Invalid item ID. Used to mask inputs to the RNN
@@ -187,7 +195,10 @@ class GRU4Rec(TorchMLAlgorithm):
             self.num_components,
             self.pad_token,
             num_layers=self.num_layers,
-            dropout=self.dropout,
+            dropout_p_embed=self.dropout_p_embed,
+            dropout_p_hidden=self.dropout_p_hidden,
+            final_activation=self.final_activation,
+            use_correct_weight_init = self.use_correct_weight_init,
         ).to(self.device)
 
         if self.optimization_algorithm == "sgd":
@@ -226,15 +237,16 @@ class GRU4Rec(TorchMLAlgorithm):
         return X
 
     def _train_epoch(self, X: InteractionMatrix) -> List[float]:
-
         losses = []
-
+        minibatch_losses = []
+        events = []
+        num_sessions = X._df[X.USER_IX].nunique()
         for (
             _,
             positives_batch,
             targets_batch,
             negatives_batch,
-        ) in self.fit_sampler.sample(X):
+        ) in tqdm(self.fit_sampler.sample(X), total=num_sessions//self.batch_size+1):
             st = time.time()
             # positives shape = (batch_size x |max_hist_length|)
             # targets shape = (batch_size x |max_hist_length|)
@@ -251,9 +263,9 @@ class GRU4Rec(TorchMLAlgorithm):
             hidden = self.model_.init_hidden(true_batch_size).to(self.device)
 
             # Generate vertical chunks of BPTT width
-            for input_chunk, target_chunk, neg_chunk in self._chunk(
+            for p, (input_chunk, target_chunk, neg_chunk) in enumerate(self._chunk(
                 self.bptt, positives_batch, targets_batch, negatives_batch
-            ):
+            )):
                 input_mask = target_chunk != self.pad_token
                 # Remove rows with only pad tokens from chunk and from hidden.
                 # We can do this because the array is sorted.
@@ -268,22 +280,25 @@ class GRU4Rec(TorchMLAlgorithm):
 
                     self.optimizer.zero_grad()
                     output, hidden[:, true_rows, :] = self.model_(true_input_chunk, true_hidden)
-
-                    loss = self._compute_loss(output, true_target_chunk, true_neg_chunk, true_input_mask)
-
-                    batch_loss += loss.item()
+                    loss = self._compute_loss(output, true_target_chunk, true_neg_chunk, true_input_mask) # * len(true_input_chunk) / self.batch_size
                     loss.backward()
-
+                    with torch.no_grad():
+                        #batch_measures += len(true_input_chunk)
+                        batch_loss += loss.item() #* len(true_input_chunk)
+                        events.append(len(true_input_chunk))
+                        minibatch_losses.append(loss.item())
+                        # assert torch.any(loss!=torch.inf) and torch.any(loss!=torch.nan)
                     if self.clipnorm:
                         nn.utils.clip_grad_norm_(self.model_.parameters(), self.clipnorm)
-                    
+
                     self.optimizer.step()
-                    
+
                     hidden = hidden.detach()
             logger.debug(f"Takes {time.time() - st} seconds to process batch")
             losses.append(batch_loss)
+            #events.append(batch_measures)
 
-        return losses
+        return losses, minibatch_losses, events
 
     def _compute_loss(
         self,
@@ -310,52 +325,91 @@ class GRU4Rec(TorchMLAlgorithm):
 
         return zip(*split_tensors)
 
-    def _predict(self, X: InteractionMatrix):
-        X_pred = lil_matrix(X.shape)
+    # def _predict(self, X: InteractionMatrix):
+    #     X_pred = lil_matrix((X.shape[0], self.num_items))
+    #     self.model_.eval()
+    #     with torch.no_grad():
+    #         # Loop through users in batches
+    #         for uid_batch, positives_batch in self.predict_sampler.sample(X):
+    #             batch_size = positives_batch.shape[0]
+    #             hidden = self.model_.init_hidden(batch_size).to(self.device)
+
+    #             # Process the history in chunks, otherwise the linear layer goes OOM.
+    #             # 3M entries seemed a reasonable max
+    #             chunk_size = int((10 ** 9) / (self.batch_size * self.num_items))
+    #             for i, (input_chunk,) in enumerate(self._chunk(chunk_size, positives_batch.to(self.device))):
+    #                 input_mask = input_chunk != self.pad_token
+    #                 # Remove rows with only pad tokens from chunk and from hidden.
+    #                 # We can do this because the array is sorted.
+    #                 true_rows = input_mask.any(axis=1)
+    #                 true_input_chunk = input_chunk[true_rows]
+    #                 true_hidden = hidden[:, true_rows, :]
+
+    #                 if true_input_chunk.shape[0] != 0:
+    #                     output_chunk, hidden[:, true_rows, :] = self.model_(true_input_chunk, true_hidden)
+    #                     # Use only the prediction for the final item, i.e. last non-padding ID.
+    #                     last_item_ix_in_chunk = (input_chunk != self.pad_token).sum(axis=1) - 1
+
+    #                     is_last_item_in_chunk = last_item_ix_in_chunk >= 0
+    #                     # Item scores is a matrix with the scores for each item
+    #                     # based on the last item in the sequence
+    #                     last_item_ix = last_item_ix_in_chunk[is_last_item_in_chunk]
+    #                     uid_batch_w_last_item = uid_batch[is_last_item_in_chunk.cpu()].detach().cpu().numpy()
+    #                     item_scores = (
+    #                         output_chunk[
+    #                             torch.arange(0, last_item_ix.shape[0], dtype=int),
+    #                             last_item_ix,
+    #                         ]
+    #                         .detach()
+    #                         .cpu()
+    #                         .numpy()
+    #                     )
+
+    #                     X_pred[uid_batch_w_last_item] = self._get_top_k_recommendations(
+    #                         csr_matrix(item_scores[:, :-1])
+    #                     )
+
+    #     return X_pred.tocsr()
+
+    def _predict(self, X: InteractionMatrix, m):
+        '''We assume that self.bptt == 1 as in the original paper
+        '''
+        X_pred = lil_matrix((X.shape[0], self.num_items))
         self.model_.eval()
         with torch.no_grad():
             # Loop through users in batches
+            sum_rec, sum_mrr, measures = np.zeros_like(m, dtype=np.uint64), np.zeros_like(m, dtype=np.double), 0
             for uid_batch, positives_batch in self.predict_sampler.sample(X):
                 batch_size = positives_batch.shape[0]
                 hidden = self.model_.init_hidden(batch_size).to(self.device)
 
-                # Process the history in chunks, otherwise the linear layer goes OOM.
-                # 3M entries seemed a reasonable max
-                chunk_size = int((10 ** 9) / (self.batch_size * self.num_items))
-                for (input_chunk,) in self._chunk(chunk_size, positives_batch.to(self.device)):
-                    input_mask = input_chunk != self.pad_token
+                positives_batch = positives_batch.to(self.device)
+                scores = torch.zeros((batch_size, self.num_items), device=self.device)
+                for i in range(positives_batch.shape[1]): #TODO: it may only be correct if self.bptt == 1, but in the original gru4rec this is the case
+                    input_chunk = positives_batch[:,i:i+1]
+                    input_mask = (input_chunk != self.pad_token).flatten()
                     # Remove rows with only pad tokens from chunk and from hidden.
                     # We can do this because the array is sorted.
-                    true_rows = input_mask.any(axis=1)
+                    true_rows = input_mask
                     true_input_chunk = input_chunk[true_rows]
                     true_hidden = hidden[:, true_rows, :]
-
                     if true_input_chunk.shape[0] != 0:
+                        if i !=0 :
+                            target_scores = scores[torch.nonzero(true_rows), true_input_chunk]
+                            other_scores = scores[true_rows]
+                            ranks = (other_scores > target_scores).sum(axis=1) + 1
+                            for j, cutoff in enumerate(m):
+                                rec = (ranks <= cutoff).sum()
+                                mrr = ((ranks <= cutoff) / ranks).sum()
+                                sum_rec[j] += rec.cpu().item()
+                                sum_mrr[j] += mrr.cpu().item()
+                            measures += len(ranks)
                         output_chunk, hidden[:, true_rows, :] = self.model_(true_input_chunk, true_hidden)
-                        # Use only the prediction for the final item, i.e. last non-padding ID.
-                        last_item_ix_in_chunk = (input_chunk != self.pad_token).sum(axis=1) - 1
-
-                        is_last_item_in_chunk = last_item_ix_in_chunk >= 0
-                        # Item scores is a matrix with the scores for each item
-                        # based on the last item in the sequence
-                        last_item_ix = last_item_ix_in_chunk[is_last_item_in_chunk]
-                        uid_batch_w_last_item = uid_batch[is_last_item_in_chunk].detach().cpu().numpy()
-                        item_scores = (
-                            output_chunk[
-                                torch.arange(0, last_item_ix.shape[0], dtype=int),
-                                last_item_ix,
-                            ]
-                            .detach()
-                            .cpu()
-                            .numpy()
-                        )
-
-                        X_pred[uid_batch_w_last_item] = self._get_top_k_recommendations(
-                            csr_matrix(item_scores[:, :-1])
-                        )
-
+                        item_scores = output_chunk[:, :, :-1].detach().squeeze(dim=1) #.cpu().numpy()
+                        scores[true_rows] = item_scores
+        for j, cutoff in enumerate(m):
+            print(f"Recall@{cutoff}: {sum_rec[j]/measures:.8f} MRR@{cutoff}: {sum_mrr[j]/measures:.8f}")
         return X_pred.tocsr()
-
 
 class GRU4RecCrossEntropy(GRU4Rec):
     """A recurrent neural network for session-based recommendations.
@@ -462,7 +516,8 @@ class GRU4RecCrossEntropy(GRU4Rec):
         num_layers: int = 1,
         hidden_size: int = 100,
         num_components: int = 250,
-        dropout: float = 0.0,
+        dropout_p_embed: float = 0,
+        dropout_p_hidden: float = 0,
         optimization_algorithm: str = "adagrad",
         momentum: float = 0.0,
         clipnorm: float = 1.0,
@@ -479,12 +534,14 @@ class GRU4RecCrossEntropy(GRU4Rec):
         keep_last: bool = False,
         predict_topK: int = None,
         validation_sample_size: int = None,
+        use_correct_weight_init: bool = False,
     ):
         super().__init__(
             num_layers=num_layers,
             hidden_size=hidden_size,
             num_components=num_components,
-            dropout=dropout,
+            dropout_p_embed=dropout_p_embed,
+            dropout_p_hidden=dropout_p_hidden,
             optimization_algorithm=optimization_algorithm,
             momentum=momentum,
             clipnorm=clipnorm,
@@ -502,6 +559,7 @@ class GRU4RecCrossEntropy(GRU4Rec):
             keep_last=keep_last,
             predict_topK=predict_topK,
             validation_sample_size=validation_sample_size,
+            use_correct_weight_init=use_correct_weight_init
         )
 
         self._criterion = nn.CrossEntropyLoss()
@@ -631,8 +689,10 @@ class GRU4RecNegSampling(GRU4Rec):
         num_layers: int = 1,
         hidden_size: int = 100,
         num_components: int = 250,
-        dropout: float = 0.0,
+        dropout_p_embed: float = 0,
+        dropout_p_hidden: float = 0,
         loss_fn: str = "bpr",
+        bpreg: float = 1.0,
         optimization_algorithm: str = "adagrad",
         momentum: float = 0.0,
         clipnorm: float = 1.0,
@@ -650,12 +710,15 @@ class GRU4RecNegSampling(GRU4Rec):
         keep_last: bool = False,
         predict_topK: int = None,
         validation_sample_size: int = None,
+        final_activation: str = None,
+        use_correct_weight_init: bool = False,
     ):
         super().__init__(
             num_layers=num_layers,
             hidden_size=hidden_size,
             num_components=num_components,
-            dropout=dropout,
+            dropout_p_embed=dropout_p_embed,
+            dropout_p_hidden=dropout_p_hidden,
             optimization_algorithm=optimization_algorithm,
             momentum=momentum,
             clipnorm=clipnorm,
@@ -673,9 +736,12 @@ class GRU4RecNegSampling(GRU4Rec):
             keep_last=keep_last,
             predict_topK=predict_topK,
             validation_sample_size=validation_sample_size,
+            final_activation = final_activation,
+            use_correct_weight_init = use_correct_weight_init,
         )
 
         self.loss_fn = loss_fn
+        self.bpreg = bpreg
 
         self._criterion = {
             "top1": top1_loss,
@@ -709,10 +775,10 @@ class GRU4RecNegSampling(GRU4Rec):
         positive_scores_flat = positive_scores.view(true_batch_size * max_hist_len, 1)
         negative_scores_flat = negative_scores.view(true_batch_size * max_hist_len, negative_scores.shape[2])
 
-        return self._criterion(
-            positive_scores_flat[true_input_mask_flat],
-            negative_scores_flat[true_input_mask_flat],
-        )
+        if self.loss_fn == 'bpr-max':
+            return self._criterion(positive_scores_flat[true_input_mask_flat], negative_scores_flat[true_input_mask_flat], self.bpreg)
+        else:
+            return self._criterion(positive_scores_flat[true_input_mask_flat], negative_scores_flat[true_input_mask_flat])
 
 
 class GRU4RecTorch(nn.Module):
@@ -740,7 +806,10 @@ class GRU4RecTorch(nn.Module):
         num_components: int,
         pad_token: int,
         num_layers: int = 1,
-        dropout: float = 0,
+        dropout_p_embed: float = 0,
+        dropout_p_hidden: float = 0,
+        final_activation: str = None,
+        use_correct_weight_init: bool = False,
     ):
         super().__init__()
         self.num_items = num_items
@@ -748,7 +817,16 @@ class GRU4RecTorch(nn.Module):
         self.hidden_size = hidden_size
         self.output_size = num_items
         self.pad_token = pad_token
-        self.drop = nn.Dropout(dropout, inplace=True)
+        self.drop_embed = nn.Dropout(dropout_p_embed)
+        self.dropout_p_hidden = dropout_p_hidden
+        self.drop_hidden = nn.Dropout(dropout_p_hidden)
+        if (final_activation == "linear") or (final_activation is None):
+            self.final_activation = nn.Identity()
+        elif final_activation.startswith('elu-'):
+            self.final_activation = nn.ELU(alpha=float(final_activation.split('-')[-1]))
+        else:
+            raise NotImplementedError
+        self.use_correct_weight_init = use_correct_weight_init
 
         # Passing pad_token will make sure these embeddings are always zero-valued.
         self.emb = nn.Embedding(num_items + 1, num_components, padding_idx=pad_token)
@@ -756,7 +834,7 @@ class GRU4RecTorch(nn.Module):
             num_components,
             hidden_size,
             num_layers=num_layers,
-            dropout=(dropout if num_layers > 1 else 0),
+            dropout=dropout_p_hidden if num_layers>1 else 0.0,
             batch_first=True,
         )
         # Also return the padding token
@@ -779,7 +857,7 @@ class GRU4RecTorch(nn.Module):
                  As Tensors of shapes (A*B, I) and (L, B, H) respectively.
         """
         emb_x = self.emb(x)
-        self.drop(emb_x)
+        emb_x = self.drop_embed(emb_x)
 
         # Check if it needs padding
         any_row_requires_padding = (x == self.pad_token).any()
@@ -796,17 +874,29 @@ class GRU4RecTorch(nn.Module):
         else:
             rnn_x, hidden = self.rnn(emb_x, hidden)
 
-        self.drop(rnn_x)
-
+        if self.dropout_p_hidden > 0:
+            rnn_x = self.drop_hidden(rnn_x)
         out = self.lin(rnn_x)
+        if self.final_activation != nn.Identity():
+            out = self.final_activation(out)
 
         return out, hidden
 
     def init_weights(self) -> None:
         """Initializes all model parameters uniformly."""
-        initrange = 0.01
-        for param in self.parameters():
-            nn.init.uniform_(param, -initrange, initrange)
+        if not self.use_correct_weight_init:
+            initrange = 0.01
+            for param in self.parameters():
+                nn.init.uniform_(param, -initrange, initrange)
+        else:
+            with torch.no_grad():
+                for name, param in self.named_parameters():
+                    if "bias" in name:
+                        param.data = torch.zeros_like(param)
+                    elif "weight" in name:
+                        shape = param.shape
+                        sigma = np.sqrt(6.0 / (shape[0] + shape[1]))
+                        nn.init.uniform_(param, 0, 2*sigma)
 
     def init_hidden(self, batch_size: int) -> torch.Tensor:
         """Returns an initial, zero-valued hidden state with shape (L B, H)."""

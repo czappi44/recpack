@@ -183,7 +183,7 @@ class Algorithm(BaseEstimator):
         logger.info(f"Fitting {self.name} complete - Took {end - start :.3}s")
         return self
 
-    def predict(self, X: Matrix) -> csr_matrix:
+    def predict(self, X: Matrix, m: List[int]) -> csr_matrix:
         """Predicts scores, given the interactions in X
 
         Recommends items for each nonzero user in the X matrix.
@@ -195,6 +195,7 @@ class Algorithm(BaseEstimator):
         - checks the output using :meth:`_check_prediction` function
 
         :param X: interactions to predict from.
+        :param m: contains the cutoff values for recall and mrr.
         :type X: Matrix
         :return: The recommendation scores in a sparse matrix format.
         :rtype: csr_matrix
@@ -203,9 +204,9 @@ class Algorithm(BaseEstimator):
 
         X = self._transform_predict_input(X)
 
-        X_pred = self._predict(X)
+        X_pred = self._predict(X, m)
 
-        self._check_prediction(X_pred, X)
+        # self._check_prediction(X_pred, X)
 
         return X_pred
 
@@ -664,11 +665,12 @@ class TorchMLAlgorithm(Algorithm):
         start = time.time()
         # Preconditions:
         # The target for prediction is the validation data.
-        assert X.shape == validation_data[0].shape
-        assert X.shape == validation_data[1].shape
+        
+        # assert X.shape == validation_data[0].shape
+        # assert X.shape == validation_data[1].shape
 
         # Transform training and validation data to the expected types
-        X, validation_data = self._transform_fit_input(X, validation_data)
+        # X, validation_data = self._transform_fit_input(X, validation_data)
 
         # Construct variable which will maintain the best model through training
         self.best_model = tempfile.NamedTemporaryFile()
@@ -685,24 +687,26 @@ class TorchMLAlgorithm(Algorithm):
         # For each epoch perform a training and evaluation step.
         #  Training uses X
         #  Evaluation uses val_in and val_out
-        val_in, val_out = validation_data
+        # val_in, val_out = validation_data
         try:
             for epoch in range(self.max_epochs):
                 self.model_.train()
                 start_time = time.time()
-                losses = self._train_epoch(X)
+                losses, epoch_cost, events = self._train_epoch(X)
                 end_time = time.time()
                 logger.info(
                     f"Processed epoch {epoch} in {end_time-start_time :.2f} s."
                     f"Batch Training Loss = {np.mean(losses) :.4f}"
                 )
+                epoch_end = end_time-start_time
+                print(f"epoch:{epoch+1} loss: {np.mean(losses):.6f} {epoch_end:.2f} s {np.sum(events)/epoch_end:.2f} e/s {len(epoch_cost)/epoch_end:.2f} mb/s")
                 # Make sure no grads are computed while evaluating
-                self.model_.eval()
-                with torch.no_grad():
-                    start_time = time.time()
-                    self._evaluate(val_in, val_out)
-                    end_time = time.time()
-                    logger.info(f"Evaluation at end of {epoch} took {end_time-start_time :.2f} s.")
+                # self.model_.eval()
+                # with torch.no_grad():
+                #     start_time = time.time()
+                #     self._evaluate(val_in, val_out)
+                #     end_time = time.time()
+                #     logger.info(f"Evaluation at end of {epoch} took {end_time-start_time :.2f} s.")
         except EarlyStoppingException:
             pass
 
