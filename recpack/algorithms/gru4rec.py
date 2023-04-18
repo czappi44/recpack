@@ -246,11 +246,8 @@ class GRU4Rec(TorchMLAlgorithm):
             positives_batch,
             targets_batch,
             negatives_batch,
-        ) in tqdm(self.fit_sampler.sample(X), total=num_sessions//self.batch_size+1):
+        ) in tqdm(self.fit_sampler.sample(X), total=num_sessions//self.batch_size+1, leave=True, position = 0):
             st = time.time()
-            # positives shape = (batch_size x |max_hist_length|)
-            # targets shape = (batch_size x |max_hist_length|)
-            # negatives shape = (batch_size x |max_hist_length| x self.num_negatives)
             positives_batch = positives_batch.to(self.device)
             targets_batch = targets_batch.to(self.device)
             negatives_batch = negatives_batch.to(self.device)
@@ -280,14 +277,12 @@ class GRU4Rec(TorchMLAlgorithm):
 
                     self.optimizer.zero_grad()
                     output, hidden[:, true_rows, :] = self.model_(true_input_chunk, true_hidden)
-                    loss = self._compute_loss(output, true_target_chunk, true_neg_chunk, true_input_mask) # * len(true_input_chunk) / self.batch_size
+                    loss = self._compute_loss(output, true_target_chunk, true_neg_chunk, true_input_mask)
                     loss.backward()
                     with torch.no_grad():
-                        #batch_measures += len(true_input_chunk)
-                        batch_loss += loss.item() #* len(true_input_chunk)
+                        batch_loss += loss.item()
                         events.append(len(true_input_chunk))
                         minibatch_losses.append(loss.item())
-                        # assert torch.any(loss!=torch.inf) and torch.any(loss!=torch.nan)
                     if self.clipnorm:
                         nn.utils.clip_grad_norm_(self.model_.parameters(), self.clipnorm)
 
@@ -296,7 +291,6 @@ class GRU4Rec(TorchMLAlgorithm):
                     hidden = hidden.detach()
             logger.debug(f"Takes {time.time() - st} seconds to process batch")
             losses.append(batch_loss)
-            #events.append(batch_measures)
 
         return losses, minibatch_losses, events
 
@@ -324,52 +318,6 @@ class GRU4Rec(TorchMLAlgorithm):
         split_tensors = [t.tensor_split(num_chunks, axis=1) for t in tensors]
 
         return zip(*split_tensors)
-
-    # def _predict(self, X: InteractionMatrix):
-    #     X_pred = lil_matrix((X.shape[0], self.num_items))
-    #     self.model_.eval()
-    #     with torch.no_grad():
-    #         # Loop through users in batches
-    #         for uid_batch, positives_batch in self.predict_sampler.sample(X):
-    #             batch_size = positives_batch.shape[0]
-    #             hidden = self.model_.init_hidden(batch_size).to(self.device)
-
-    #             # Process the history in chunks, otherwise the linear layer goes OOM.
-    #             # 3M entries seemed a reasonable max
-    #             chunk_size = int((10 ** 9) / (self.batch_size * self.num_items))
-    #             for i, (input_chunk,) in enumerate(self._chunk(chunk_size, positives_batch.to(self.device))):
-    #                 input_mask = input_chunk != self.pad_token
-    #                 # Remove rows with only pad tokens from chunk and from hidden.
-    #                 # We can do this because the array is sorted.
-    #                 true_rows = input_mask.any(axis=1)
-    #                 true_input_chunk = input_chunk[true_rows]
-    #                 true_hidden = hidden[:, true_rows, :]
-
-    #                 if true_input_chunk.shape[0] != 0:
-    #                     output_chunk, hidden[:, true_rows, :] = self.model_(true_input_chunk, true_hidden)
-    #                     # Use only the prediction for the final item, i.e. last non-padding ID.
-    #                     last_item_ix_in_chunk = (input_chunk != self.pad_token).sum(axis=1) - 1
-
-    #                     is_last_item_in_chunk = last_item_ix_in_chunk >= 0
-    #                     # Item scores is a matrix with the scores for each item
-    #                     # based on the last item in the sequence
-    #                     last_item_ix = last_item_ix_in_chunk[is_last_item_in_chunk]
-    #                     uid_batch_w_last_item = uid_batch[is_last_item_in_chunk.cpu()].detach().cpu().numpy()
-    #                     item_scores = (
-    #                         output_chunk[
-    #                             torch.arange(0, last_item_ix.shape[0], dtype=int),
-    #                             last_item_ix,
-    #                         ]
-    #                         .detach()
-    #                         .cpu()
-    #                         .numpy()
-    #                     )
-
-    #                     X_pred[uid_batch_w_last_item] = self._get_top_k_recommendations(
-    #                         csr_matrix(item_scores[:, :-1])
-    #                     )
-
-    #     return X_pred.tocsr()
 
     def _predict(self, X: InteractionMatrix, m):
         '''We assume that self.bptt == 1 as in the original paper

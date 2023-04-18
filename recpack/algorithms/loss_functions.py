@@ -337,7 +337,7 @@ def bpr_max_loss(positive_scores: torch.Tensor, negative_scores: torch.Tensor, r
     score_diff = weights * torch.sigmoid(positive_scores - negative_scores)
     norm_penalty = weights * negative_scores ** 2
 
-    return (-torch.log(score_diff.sum(dim=1)+1e-24) + reg * norm_penalty.sum(dim=1)).mean() #eps is needed inside the log to avoid log(0) = inf
+    return (-torch.log(score_diff.sum(dim=1)+1e-24) + reg * norm_penalty.sum(dim=1)).mean() # eps is needed inside the log to avoid log(0)
 
 
 def top1_loss(positive_scores: torch.Tensor, negative_scores: torch.Tensor) -> torch.Tensor:

@@ -287,19 +287,12 @@ class PipelineBuilder(object):
         # Validate shape is correct
         shape = self.full_training_data.shape
 
-        # if any([d.shape != shape for d in self.test_data]):
-        #     raise RuntimeError("Shape mismatch between test and training data")
-
         if hasattr(self, "validation_data") and any([d.shape != shape for d in self.validation_data]):
             raise RuntimeError("Shape mismatch between validation and training data")
 
         if hasattr(self, "validation_training_data") and self.validation_training_data.shape != shape:
             raise RuntimeError("Shape mismatch between validation training data and full training data")
 
-    # def _requires_validation_data(self) -> bool:
-    #     return any([algo.optimise for algo in self.algorithm_entries]) or any(
-    #         [issubclass(ALGORITHM_REGISTRY.get(algo.name), TorchMLAlgorithm) for algo in self.algorithm_entries]
-    #     )
     def _requires_validation_data(self) -> bool:
         return False
 

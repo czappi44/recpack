@@ -701,12 +701,6 @@ class TorchMLAlgorithm(Algorithm):
                 epoch_end = end_time-start_time
                 print(f"epoch:{epoch+1} loss: {np.mean(losses):.6f} {epoch_end:.2f} s {np.sum(events)/epoch_end:.2f} e/s {len(epoch_cost)/epoch_end:.2f} mb/s")
                 # Make sure no grads are computed while evaluating
-                # self.model_.eval()
-                # with torch.no_grad():
-                #     start_time = time.time()
-                #     self._evaluate(val_in, val_out)
-                #     end_time = time.time()
-                #     logger.info(f"Evaluation at end of {epoch} took {end_time-start_time :.2f} s.")
         except EarlyStoppingException:
             pass
 
